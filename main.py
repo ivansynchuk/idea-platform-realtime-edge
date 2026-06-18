@@ -18,7 +18,9 @@ import logging
 import os
 import socket
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Any
+from uuid import uuid4
 
 import jwt
 import redis.asyncio as redis_async
@@ -43,11 +45,19 @@ REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
 # --- Redis bridge constants ---------------------------------------------------
 
 DOWNSTREAM_STREAM = "edge:downstream"
+UPSTREAM_STREAM = "edge:upstream"
 CONSUMER_GROUP = "edge"
 DLQ_STREAM = "edge:downstream:dlq"
 READ_COUNT = 50
 BLOCK_MS = 5000
 DLQ_MAXLEN = 10_000
+UPSTREAM_MAXLEN = 100_000
+
+# Identifies this edge process in upstream envelopes and as the consumer name.
+WORKER_ID = f"{socket.gethostname()}-{os.getpid()}"
+
+# Shared Redis client, assigned during the FastAPI lifespan startup.
+redis_client: redis_async.Redis | None = None
 
 # Maps the envelope namespace name to the Socket.IO namespace path.
 NAMESPACE_BY_NAME = {"root": "/", "live-chat": "/live-chat"}
@@ -65,8 +75,9 @@ sio = socketio.AsyncServer(
 
 
 class DownstreamTarget(BaseModel):
-    type: str
-    room: str
+    type: str  # "room" (broadcast) | "sid" (single socket, e.g. control events)
+    room: str | None = None
+    sid: str | None = None
 
 
 class DownstreamMeta(BaseModel):
@@ -82,6 +93,28 @@ class DownstreamEnvelope(BaseModel):
     event: str
     payload: Any = None
     meta: DownstreamMeta | None = None
+
+
+class UpstreamMeta(BaseModel):
+    id: str
+    ts: str
+    source: str = "edge"
+    worker: str | None = None
+
+
+class UpstreamEnvelope(BaseModel):
+    """Client-originated event forwarded edge -> monolith over edge:upstream.
+
+    `userId` is stamped from the verified JWT session and is authoritative; the
+    monolith must ignore any identity embedded in `payload`."""
+
+    v: int = 1
+    event: str
+    userId: str
+    sid: str | None = None
+    clientMsgId: str
+    payload: Any = None
+    meta: UpstreamMeta
 
 
 # --- Auth helpers -------------------------------------------------------------
@@ -163,6 +196,42 @@ def _live_chat_room(room_id: str) -> str:
     return f"live-chat:{room_id}"
 
 
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+async def _publish_upstream(
+    event: str,
+    user_id: str,
+    payload: Any,
+    sid: str | None = None,
+    client_msg_id: str | None = None,
+) -> str | None:
+    """Stamp identity and XADD a client-originated event to edge:upstream.
+
+    Returns the correlation clientMsgId, or None if Redis is not ready."""
+    if redis_client is None:
+        logger.error("cannot publish upstream '%s': redis not ready", event)
+        return None
+
+    correlation_id = client_msg_id or uuid4().hex
+    envelope = UpstreamEnvelope(
+        event=event,
+        userId=user_id,
+        sid=sid,
+        clientMsgId=correlation_id,
+        payload=payload,
+        meta=UpstreamMeta(id=uuid4().hex, ts=_now_iso(), worker=WORKER_ID),
+    )
+    await redis_client.xadd(
+        UPSTREAM_STREAM,
+        {"payload": envelope.model_dump_json()},
+        maxlen=UPSTREAM_MAXLEN,
+        approximate=True,
+    )
+    return correlation_id
+
+
 # --- Socket.IO handlers: root namespace ("/") --------------------------------
 
 
@@ -203,21 +272,53 @@ async def live_chat_disconnect(sid: str) -> None:
 
 
 @sio.on("join_room", namespace=LIVE_CHAT_NAMESPACE)
-async def live_chat_join_room(sid: str, data: object):
+async def live_chat_join_room(sid: str, data: object) -> None:
+    # Asynchronous authorization: the edge cannot authorize a room join (no DB).
+    # It forwards a request upstream and joins the socket only when the monolith
+    # replies with room:join_approved on edge:downstream. No synchronous ack.
     session = await sio.get_session(sid, namespace=LIVE_CHAT_NAMESPACE)
-    if not session.get("user_id"):
-        return {"ok": False, "error": "Unauthorized"}
-
+    user_id = session.get("user_id")
     room_id = _extract_room_id(data)
-    if not room_id:
-        return {"ok": False, "error": "roomId is required"}
 
-    await sio.enter_room(sid, _live_chat_room(room_id), namespace=LIVE_CHAT_NAMESPACE)
-    return {"ok": True}
+    if not user_id or not room_id:
+        # A malformed/unauthenticated request the edge can reject locally — sent
+        # as an async event (not a callback ack) to match the approve/deny flow.
+        await sio.emit(
+            "room:join_denied",
+            {"roomId": room_id, "reason": "roomId is required"},
+            to=sid,
+            namespace=LIVE_CHAT_NAMESPACE,
+        )
+        return
+
+    await _publish_upstream(
+        event="room:request_join",
+        user_id=user_id,
+        sid=sid,
+        payload={"roomId": room_id},
+    )
+
+
+@sio.on("send_message", namespace=LIVE_CHAT_NAMESPACE)
+async def live_chat_send_message(sid: str, data: object) -> None:
+    # Forward to the monolith for persistence + broadcast. The persisted message
+    # returns to the room via edge:downstream; no synchronous ack here.
+    session = await sio.get_session(sid, namespace=LIVE_CHAT_NAMESPACE)
+    user_id = session.get("user_id")
+    if not user_id:
+        return
+
+    await _publish_upstream(
+        event="message:send",
+        user_id=user_id,
+        sid=sid,
+        payload=data,
+    )
 
 
 @sio.on("leave_room", namespace=LIVE_CHAT_NAMESPACE)
 async def live_chat_leave_room(sid: str, data: object):
+    # Leaving needs no authorization, so it stays local and synchronous.
     room_id = _extract_room_id(data)
     if not room_id:
         return {"ok": False, "error": "roomId is required"}
@@ -236,14 +337,49 @@ def _resolve_namespace(name: str) -> str:
     return "/" + name.lstrip("/")
 
 
-async def _emit_envelope(envelope: DownstreamEnvelope) -> None:
-    """Forward a validated envelope to its target Socket.IO namespace + room."""
+def _validate_envelope(envelope: DownstreamEnvelope) -> None:
+    """Structural routing checks beyond schema; raises ValueError if malformed."""
+    if envelope.event == "room:join_approved":
+        if not envelope.target.sid:
+            raise ValueError("room:join_approved missing target.sid")
+        if not (
+            isinstance(envelope.payload, dict) and envelope.payload.get("roomId")
+        ):
+            raise ValueError("room:join_approved missing payload.roomId")
+        return
+    if envelope.target.type == "sid":
+        if not envelope.target.sid:
+            raise ValueError("sid target missing 'sid'")
+    elif not envelope.target.room:
+        raise ValueError("room target missing 'room'")
+
+
+async def _apply_join_approved(
+    envelope: DownstreamEnvelope, namespace: str
+) -> None:
+    """Execute the deferred room join, then notify the requesting socket."""
+    sid = envelope.target.sid
+    payload = envelope.payload if isinstance(envelope.payload, dict) else {}
+    room_id = payload.get("roomId")
+    if sid and room_id:
+        await sio.enter_room(sid, _live_chat_room(room_id), namespace=namespace)
     await sio.emit(
-        envelope.event,
-        envelope.payload,
-        room=envelope.target.room,
-        namespace=_resolve_namespace(envelope.namespace),
+        "room:join_approved", envelope.payload, to=sid, namespace=namespace
     )
+
+
+async def _dispatch_envelope(envelope: DownstreamEnvelope) -> None:
+    """Route a validated downstream envelope to Socket.IO."""
+    namespace = _resolve_namespace(envelope.namespace)
+    if envelope.event == "room:join_approved":
+        await _apply_join_approved(envelope, namespace)
+        return
+    to = (
+        envelope.target.sid
+        if envelope.target.type == "sid"
+        else envelope.target.room
+    )
+    await sio.emit(envelope.event, envelope.payload, to=to, namespace=namespace)
 
 
 async def _ensure_group(client: redis_async.Redis) -> None:
@@ -279,6 +415,7 @@ async def _handle_message(
         if raw is None:
             raise ValueError("stream entry missing 'payload' field")
         envelope = DownstreamEnvelope.model_validate_json(raw)
+        _validate_envelope(envelope)
     except (ValidationError, ValueError) as exc:
         logger.warning("poison message %s -> DLQ: %s", msg_id, exc)
         await client.xadd(
@@ -291,12 +428,12 @@ async def _handle_message(
         return
 
     try:
-        await _emit_envelope(envelope)
+        await _dispatch_envelope(envelope)
     except Exception:
         # Transient delivery failure: do NOT ack so the entry stays pending and
         # can be reclaimed (XAUTOCLAIM) later. A single pending entry does not
         # block new messages read with '>'.
-        logger.exception("emit failed for %s; leaving unacked", msg_id)
+        logger.exception("dispatch failed for %s; leaving unacked", msg_id)
         return
 
     await client.xack(DOWNSTREAM_STREAM, CONSUMER_GROUP, msg_id)
@@ -304,7 +441,7 @@ async def _handle_message(
 
 async def _downstream_listener(client: redis_async.Redis) -> None:
     """Infinite XREADGROUP loop bridging `edge:downstream` to Socket.IO."""
-    consumer = f"{socket.gethostname()}-{os.getpid()}"
+    consumer = WORKER_ID
     logger.info(
         "downstream listener started (group=%s consumer=%s)",
         CONSUMER_GROUP,
@@ -339,6 +476,7 @@ async def _downstream_listener(client: redis_async.Redis) -> None:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    global redis_client
     redis_client = redis_async.from_url(REDIS_URL, decode_responses=True)
     await _ensure_group(redis_client)
     listener = asyncio.create_task(_downstream_listener(redis_client))
@@ -350,6 +488,7 @@ async def lifespan(_app: FastAPI):
         with contextlib.suppress(asyncio.CancelledError):
             await listener
         await redis_client.aclose()
+        redis_client = None
         logger.info("realtime edge shut down")
 
 
