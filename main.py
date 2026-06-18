@@ -51,6 +51,7 @@ DLQ_MAXLEN = 10_000
 
 # Maps the envelope namespace name to the Socket.IO namespace path.
 NAMESPACE_BY_NAME = {"root": "/", "live-chat": "/live-chat"}
+LIVE_CHAT_NAMESPACE = "/live-chat"
 
 # --- Socket.IO server ---------------------------------------------------------
 
@@ -114,16 +115,17 @@ def _resolve_user_id(claims: dict) -> str | None:
     return None
 
 
-# --- Socket.IO handlers -------------------------------------------------------
+async def _authenticate_socket(
+    sid: str, environ: dict, auth: object, namespace: str = "/"
+) -> str:
+    """Strict, stateless JWT handshake shared by every namespace.
 
-
-@sio.event
-async def connect(sid: str, environ: dict, auth: object) -> None:
-    # Defense-in-depth: reject HTTP long-polling. Websocket-only is primarily
-    # enforced by the client (transports: ["websocket"]); we fail open if the
-    # transport cannot be determined so a valid client is never blocked.
+    Returns the authenticated user id or raises ConnectionRefusedError. No DB
+    access — the token signature and claims are the sole source of truth."""
+    # Defense-in-depth: reject HTTP long-polling. Fail open if the transport
+    # cannot be determined so a valid client is never blocked.
     try:
-        transport = sio.transport(sid)
+        transport = sio.transport(sid, namespace=namespace)
     except Exception:  # pragma: no cover - python-socketio API/version safety
         transport = None
     if transport == "polling":
@@ -144,14 +146,84 @@ async def connect(sid: str, environ: dict, auth: object) -> None:
     if not user_id:
         raise socketio.exceptions.ConnectionRefusedError("token missing user id")
 
+    return user_id
+
+
+def _extract_room_id(data: object) -> str | None:
+    """Pull a non-empty `roomId` from a join/leave payload."""
+    if isinstance(data, dict):
+        room_id = data.get("roomId")
+        if isinstance(room_id, str) and room_id:
+            return room_id
+    return None
+
+
+def _live_chat_room(room_id: str) -> str:
+    """Socket.IO room name for a live-chat room (matches the monolith)."""
+    return f"live-chat:{room_id}"
+
+
+# --- Socket.IO handlers: root namespace ("/") --------------------------------
+
+
+@sio.event
+async def connect(sid: str, environ: dict, auth: object) -> None:
+    user_id = await _authenticate_socket(sid, environ, auth)
     await sio.save_session(sid, {"user_id": user_id})
     await sio.enter_room(sid, f"user:{user_id}")
-    logger.info("socket %s authenticated as user %s", sid, user_id)
+    logger.info("socket %s authenticated as user %s (root)", sid, user_id)
 
 
 @sio.event
 async def disconnect(sid: str) -> None:
-    logger.info("socket %s disconnected", sid)
+    logger.info("socket %s disconnected (root)", sid)
+
+
+# --- Socket.IO handlers: "/live-chat" namespace ------------------------------
+#
+# NOTE: room *authorization* (the monolith's assertRoomAccess) requires DB
+# access and is out of scope for this stateless edge. join_room only validates
+# that a roomId is present; enforcing membership must happen upstream (the
+# monolith) in a later phase.
+
+
+@sio.on("connect", namespace=LIVE_CHAT_NAMESPACE)
+async def live_chat_connect(sid: str, environ: dict, auth: object) -> None:
+    user_id = await _authenticate_socket(
+        sid, environ, auth, namespace=LIVE_CHAT_NAMESPACE
+    )
+    await sio.save_session(sid, {"user_id": user_id}, namespace=LIVE_CHAT_NAMESPACE)
+    await sio.emit("connection_ready", to=sid, namespace=LIVE_CHAT_NAMESPACE)
+    logger.info("socket %s authenticated as user %s (/live-chat)", sid, user_id)
+
+
+@sio.on("disconnect", namespace=LIVE_CHAT_NAMESPACE)
+async def live_chat_disconnect(sid: str) -> None:
+    logger.info("socket %s disconnected (/live-chat)", sid)
+
+
+@sio.on("join_room", namespace=LIVE_CHAT_NAMESPACE)
+async def live_chat_join_room(sid: str, data: object):
+    session = await sio.get_session(sid, namespace=LIVE_CHAT_NAMESPACE)
+    if not session.get("user_id"):
+        return {"ok": False, "error": "Unauthorized"}
+
+    room_id = _extract_room_id(data)
+    if not room_id:
+        return {"ok": False, "error": "roomId is required"}
+
+    await sio.enter_room(sid, _live_chat_room(room_id), namespace=LIVE_CHAT_NAMESPACE)
+    return {"ok": True}
+
+
+@sio.on("leave_room", namespace=LIVE_CHAT_NAMESPACE)
+async def live_chat_leave_room(sid: str, data: object):
+    room_id = _extract_room_id(data)
+    if not room_id:
+        return {"ok": False, "error": "roomId is required"}
+
+    await sio.leave_room(sid, _live_chat_room(room_id), namespace=LIVE_CHAT_NAMESPACE)
+    return {"ok": True}
 
 
 # --- Redis downstream bridge (Phase 4) ----------------------------------------
