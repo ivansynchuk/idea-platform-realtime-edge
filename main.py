@@ -1,15 +1,3 @@
-"""
-Realtime edge — standalone Socket.IO transport service (strangler Phase 1/2/4).
-
-A stateless transport edge for the NestJS monolith's WebSocket layer:
-  * validates the monolith's JWT cryptographically (HS256, shared JWT_SECRET),
-  * has ZERO database access (no SQLAlchemy / asyncpg / drivers),
-  * joins each authenticated socket to its personal `user:{id}` room,
-  * bridges monolith broadcasts: a background consumer reads the
-    `edge:downstream` Redis stream (consumer group `edge`) and re-emits each
-    DownstreamEnvelope to the matching Socket.IO namespace + room.
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -32,8 +20,6 @@ from redis.exceptions import ResponseError
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("realtime-edge")
 
-# --- Configuration (environment) ---------------------------------------------
-
 JWT_SECRET = os.environ.get("JWT_SECRET")
 if not JWT_SECRET:
     raise RuntimeError("JWT_SECRET environment variable is required")
@@ -41,8 +27,6 @@ if not JWT_SECRET:
 JWT_ALGORITHM = "HS256"
 FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:5173")
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
-
-# --- Redis bridge constants ---------------------------------------------------
 
 DOWNSTREAM_STREAM = "edge:downstream"
 UPSTREAM_STREAM = "edge:upstream"
@@ -53,38 +37,27 @@ BLOCK_MS = 5000
 DLQ_MAXLEN = 10_000
 UPSTREAM_MAXLEN = 100_000
 
-# Identifies this edge process in upstream envelopes and as the consumer name.
 WORKER_ID = f"{socket.gethostname()}-{os.getpid()}"
 
-# Shared Redis client, assigned during the FastAPI lifespan startup.
 redis_client: redis_async.Redis | None = None
 
-# Maps the envelope namespace name to the Socket.IO namespace path.
 NAMESPACE_BY_NAME = {"root": "/", "live-chat": "/live-chat"}
 LIVE_CHAT_NAMESPACE = "/live-chat"
-
-# --- Socket.IO server ---------------------------------------------------------
 
 sio = socketio.AsyncServer(
     async_mode="asgi",
     cors_allowed_origins=[FRONTEND_URL],
 )
 
-
-# --- Downstream envelope schema (must match backend realtime.types.ts) --------
-
-
 class DownstreamTarget(BaseModel):
-    type: str  # "room" (broadcast) | "sid" (single socket, e.g. control events)
+    type: str
     room: str | None = None
     sid: str | None = None
-
 
 class DownstreamMeta(BaseModel):
     id: str | None = None
     ts: str | None = None
     source: str | None = None
-
 
 class DownstreamEnvelope(BaseModel):
     v: int
@@ -94,20 +67,13 @@ class DownstreamEnvelope(BaseModel):
     payload: Any = None
     meta: DownstreamMeta | None = None
 
-
 class UpstreamMeta(BaseModel):
     id: str
     ts: str
     source: str = "edge"
     worker: str | None = None
 
-
 class UpstreamEnvelope(BaseModel):
-    """Client-originated event forwarded edge -> monolith over edge:upstream.
-
-    `userId` is stamped from the verified JWT session and is authoritative; the
-    monolith must ignore any identity embedded in `payload`."""
-
     v: int = 1
     event: str
     userId: str
@@ -116,13 +82,7 @@ class UpstreamEnvelope(BaseModel):
     payload: Any = None
     meta: UpstreamMeta
 
-
-# --- Auth helpers -------------------------------------------------------------
-
-
 def _extract_token(auth: object, environ: dict) -> str | None:
-    """Token from the Socket.IO `auth` payload (auth.token), falling back to a
-    Bearer Authorization header — mirroring the monolith's handshake."""
     if isinstance(auth, dict):
         token = auth.get("token")
         if isinstance(token, str) and token:
@@ -136,30 +96,19 @@ def _extract_token(auth: object, environ: dict) -> str | None:
 
     return None
 
-
 def _resolve_user_id(claims: dict) -> str | None:
-    """The monolith signs the user id in the `id` claim (see
-    backend/src/notification/lib/ws-auth.util.ts). `sub`/`userId` are accepted
-    as fallbacks for forward-compatibility."""
     for key in ("id", "sub", "userId"):
         value = claims.get(key)
         if isinstance(value, str) and value:
             return value
     return None
 
-
 async def _authenticate_socket(
     sid: str, environ: dict, auth: object, namespace: str = "/"
 ) -> str:
-    """Strict, stateless JWT handshake shared by every namespace.
-
-    Returns the authenticated user id or raises ConnectionRefusedError. No DB
-    access — the token signature and claims are the sole source of truth."""
-    # Defense-in-depth: reject HTTP long-polling. Fail open if the transport
-    # cannot be determined so a valid client is never blocked.
     try:
         transport = sio.transport(sid, namespace=namespace)
-    except Exception:  # pragma: no cover - python-socketio API/version safety
+    except Exception:
         transport = None
     if transport == "polling":
         raise socketio.exceptions.ConnectionRefusedError(
@@ -181,24 +130,18 @@ async def _authenticate_socket(
 
     return user_id
 
-
 def _extract_room_id(data: object) -> str | None:
-    """Pull a non-empty `roomId` from a join/leave payload."""
     if isinstance(data, dict):
         room_id = data.get("roomId")
         if isinstance(room_id, str) and room_id:
             return room_id
     return None
 
-
 def _live_chat_room(room_id: str) -> str:
-    """Socket.IO room name for a live-chat room (matches the monolith)."""
     return f"live-chat:{room_id}"
-
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
-
 
 async def _publish_upstream(
     event: str,
@@ -207,9 +150,6 @@ async def _publish_upstream(
     sid: str | None = None,
     client_msg_id: str | None = None,
 ) -> str | None:
-    """Stamp identity and XADD a client-originated event to edge:upstream.
-
-    Returns the correlation clientMsgId, or None if Redis is not ready."""
     if redis_client is None:
         logger.error("cannot publish upstream '%s': redis not ready", event)
         return None
@@ -231,10 +171,6 @@ async def _publish_upstream(
     )
     return correlation_id
 
-
-# --- Socket.IO handlers: root namespace ("/") --------------------------------
-
-
 @sio.event
 async def connect(sid: str, environ: dict, auth: object) -> None:
     user_id = await _authenticate_socket(sid, environ, auth)
@@ -242,19 +178,9 @@ async def connect(sid: str, environ: dict, auth: object) -> None:
     await sio.enter_room(sid, f"user:{user_id}")
     logger.info("socket %s authenticated as user %s (root)", sid, user_id)
 
-
 @sio.event
 async def disconnect(sid: str) -> None:
     logger.info("socket %s disconnected (root)", sid)
-
-
-# --- Socket.IO handlers: "/live-chat" namespace ------------------------------
-#
-# NOTE: room *authorization* (the monolith's assertRoomAccess) requires DB
-# access and is out of scope for this stateless edge. join_room only validates
-# that a roomId is present; enforcing membership must happen upstream (the
-# monolith) in a later phase.
-
 
 @sio.on("connect", namespace=LIVE_CHAT_NAMESPACE)
 async def live_chat_connect(sid: str, environ: dict, auth: object) -> None:
@@ -265,24 +191,17 @@ async def live_chat_connect(sid: str, environ: dict, auth: object) -> None:
     await sio.emit("connection_ready", to=sid, namespace=LIVE_CHAT_NAMESPACE)
     logger.info("socket %s authenticated as user %s (/live-chat)", sid, user_id)
 
-
 @sio.on("disconnect", namespace=LIVE_CHAT_NAMESPACE)
 async def live_chat_disconnect(sid: str) -> None:
     logger.info("socket %s disconnected (/live-chat)", sid)
 
-
 @sio.on("join_room", namespace=LIVE_CHAT_NAMESPACE)
 async def live_chat_join_room(sid: str, data: object) -> None:
-    # Asynchronous authorization: the edge cannot authorize a room join (no DB).
-    # It forwards a request upstream and joins the socket only when the monolith
-    # replies with room:join_approved on edge:downstream. No synchronous ack.
     session = await sio.get_session(sid, namespace=LIVE_CHAT_NAMESPACE)
     user_id = session.get("user_id")
     room_id = _extract_room_id(data)
 
     if not user_id or not room_id:
-        # A malformed/unauthenticated request the edge can reject locally — sent
-        # as an async event (not a callback ack) to match the approve/deny flow.
         await sio.emit(
             "room:join_denied",
             {"roomId": room_id, "reason": "roomId is required"},
@@ -298,11 +217,8 @@ async def live_chat_join_room(sid: str, data: object) -> None:
         payload={"roomId": room_id},
     )
 
-
 @sio.on("send_message", namespace=LIVE_CHAT_NAMESPACE)
 async def live_chat_send_message(sid: str, data: object) -> None:
-    # Forward to the monolith for persistence + broadcast. The persisted message
-    # returns to the room via edge:downstream; no synchronous ack here.
     session = await sio.get_session(sid, namespace=LIVE_CHAT_NAMESPACE)
     user_id = session.get("user_id")
     if not user_id:
@@ -315,10 +231,8 @@ async def live_chat_send_message(sid: str, data: object) -> None:
         payload=data,
     )
 
-
 @sio.on("leave_room", namespace=LIVE_CHAT_NAMESPACE)
 async def live_chat_leave_room(sid: str, data: object):
-    # Leaving needs no authorization, so it stays local and synchronous.
     room_id = _extract_room_id(data)
     if not room_id:
         return {"ok": False, "error": "roomId is required"}
@@ -326,19 +240,12 @@ async def live_chat_leave_room(sid: str, data: object):
     await sio.leave_room(sid, _live_chat_room(room_id), namespace=LIVE_CHAT_NAMESPACE)
     return {"ok": True}
 
-
-# --- Redis downstream bridge (Phase 4) ----------------------------------------
-
-
 def _resolve_namespace(name: str) -> str:
-    """Map an envelope namespace name to a Socket.IO namespace path."""
     if name in NAMESPACE_BY_NAME:
         return NAMESPACE_BY_NAME[name]
     return "/" + name.lstrip("/")
 
-
 def _validate_envelope(envelope: DownstreamEnvelope) -> None:
-    """Structural routing checks beyond schema; raises ValueError if malformed."""
     if envelope.event == "room:join_approved":
         if not envelope.target.sid:
             raise ValueError("room:join_approved missing target.sid")
@@ -353,11 +260,9 @@ def _validate_envelope(envelope: DownstreamEnvelope) -> None:
     elif not envelope.target.room:
         raise ValueError("room target missing 'room'")
 
-
 async def _apply_join_approved(
     envelope: DownstreamEnvelope, namespace: str
 ) -> None:
-    """Execute the deferred room join, then notify the requesting socket."""
     sid = envelope.target.sid
     payload = envelope.payload if isinstance(envelope.payload, dict) else {}
     room_id = payload.get("roomId")
@@ -367,9 +272,7 @@ async def _apply_join_approved(
         "room:join_approved", envelope.payload, to=sid, namespace=namespace
     )
 
-
 async def _dispatch_envelope(envelope: DownstreamEnvelope) -> None:
-    """Route a validated downstream envelope to Socket.IO."""
     namespace = _resolve_namespace(envelope.namespace)
     if envelope.event == "room:join_approved":
         await _apply_join_approved(envelope, namespace)
@@ -381,13 +284,7 @@ async def _dispatch_envelope(envelope: DownstreamEnvelope) -> None:
     )
     await sio.emit(envelope.event, envelope.payload, to=to, namespace=namespace)
 
-
 async def _ensure_group(client: redis_async.Redis) -> None:
-    """Create the `edge` consumer group on `edge:downstream` (idempotent).
-
-    Starts at `$` so the edge only receives broadcasts produced after it comes
-    online — stale broadcasts are never replayed (the monolith + DB remain the
-    source of truth for history)."""
     try:
         await client.xgroup_create(
             DOWNSTREAM_STREAM, CONSUMER_GROUP, id="$", mkstream=True
@@ -401,15 +298,9 @@ async def _ensure_group(client: redis_async.Redis) -> None:
         else:
             raise
 
-
 async def _handle_message(
     client: redis_async.Redis, msg_id: str, fields: dict
 ) -> None:
-    """Validate, route, and acknowledge a single stream entry.
-
-    Poison messages (missing/invalid JSON or schema) are moved to the DLQ and
-    acked so they never block the group. The entry is acked only after a
-    successful emit; emit failures leave it pending for later reclaim."""
     raw = fields.get("payload")
     try:
         if raw is None:
@@ -430,17 +321,12 @@ async def _handle_message(
     try:
         await _dispatch_envelope(envelope)
     except Exception:
-        # Transient delivery failure: do NOT ack so the entry stays pending and
-        # can be reclaimed (XAUTOCLAIM) later. A single pending entry does not
-        # block new messages read with '>'.
         logger.exception("dispatch failed for %s; leaving unacked", msg_id)
         return
 
     await client.xack(DOWNSTREAM_STREAM, CONSUMER_GROUP, msg_id)
 
-
 async def _downstream_listener(client: redis_async.Redis) -> None:
-    """Infinite XREADGROUP loop bridging `edge:downstream` to Socket.IO."""
     consumer = WORKER_ID
     logger.info(
         "downstream listener started (group=%s consumer=%s)",
@@ -470,10 +356,6 @@ async def _downstream_listener(client: redis_async.Redis) -> None:
             for msg_id, fields in messages:
                 await _handle_message(client, msg_id, fields)
 
-
-# --- App lifespan + FastAPI ---------------------------------------------------
-
-
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     global redis_client
@@ -491,16 +373,10 @@ async def lifespan(_app: FastAPI):
         redis_client = None
         logger.info("realtime edge shut down")
 
-
 fastapi_app = FastAPI(title="Realtime Edge", version="0.1.0", lifespan=lifespan)
-
 
 @fastapi_app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
 
-
-# Combined ASGI app: /socket.io/* -> Socket.IO, everything else -> FastAPI.
-# socketio.ASGIApp forwards the ASGI lifespan scope to other_asgi_app, so the
-# FastAPI lifespan above (and the Redis listener) runs under uvicorn.
 app = socketio.ASGIApp(sio, other_asgi_app=fastapi_app, socketio_path="socket.io")
