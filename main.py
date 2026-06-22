@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import socket
@@ -15,7 +16,11 @@ import redis.asyncio as redis_async
 import socketio
 from fastapi import FastAPI
 from pydantic import BaseModel, ValidationError
-from redis.exceptions import ResponseError
+from redis.exceptions import (
+    ConnectionError as RedisConnectionError,
+    ResponseError,
+    TimeoutError as RedisTimeoutError,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("realtime-edge")
@@ -36,6 +41,8 @@ READ_COUNT = 50
 BLOCK_MS = 5000
 DLQ_MAXLEN = 10_000
 UPSTREAM_MAXLEN = 100_000
+MAX_FRAME_BYTES = 64_000
+MAX_PAYLOAD_BYTES = 16_000
 
 WORKER_ID = f"{socket.gethostname()}-{os.getpid()}"
 
@@ -44,9 +51,14 @@ redis_client: redis_async.Redis | None = None
 NAMESPACE_BY_NAME = {"root": "/", "live-chat": "/live-chat"}
 LIVE_CHAT_NAMESPACE = "/live-chat"
 
+def _get_cors_origins() -> list[str]:
+    origins_str = os.environ.get("FRONTEND_URL", "http://localhost:5173")
+    return [origin.strip().rstrip("/") for origin in origins_str.split(",")]
+
 sio = socketio.AsyncServer(
     async_mode="asgi",
-    cors_allowed_origins=[FRONTEND_URL],
+    cors_allowed_origins=_get_cors_origins(),
+    max_http_buffer_size=MAX_FRAME_BYTES,
 )
 
 class DownstreamTarget(BaseModel):
@@ -120,7 +132,12 @@ async def _authenticate_socket(
         raise socketio.exceptions.ConnectionRefusedError("missing auth token")
 
     try:
-        claims = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        claims = jwt.decode(
+            token,
+            JWT_SECRET,
+            algorithms=[JWT_ALGORITHM],
+            options={"require": ["exp"]},
+        )
     except jwt.PyJWTError as exc:
         raise socketio.exceptions.ConnectionRefusedError("invalid token") from exc
 
@@ -136,6 +153,15 @@ def _extract_room_id(data: object) -> str | None:
         if isinstance(room_id, str) and room_id:
             return room_id
     return None
+
+def _is_acceptable_payload(data: object) -> bool:
+    if not isinstance(data, dict):
+        return False
+    try:
+        encoded = json.dumps(data, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return False
+    return len(encoded.encode("utf-8")) <= MAX_PAYLOAD_BYTES
 
 def _live_chat_room(room_id: str) -> str:
     return f"live-chat:{room_id}"
@@ -163,12 +189,18 @@ async def _publish_upstream(
         payload=payload,
         meta=UpstreamMeta(id=uuid4().hex, ts=_now_iso(), worker=WORKER_ID),
     )
-    await redis_client.xadd(
-        UPSTREAM_STREAM,
-        {"payload": envelope.model_dump_json()},
-        maxlen=UPSTREAM_MAXLEN,
-        approximate=True,
-    )
+    try:
+        await redis_client.xadd(
+            UPSTREAM_STREAM,
+            {"payload": envelope.model_dump_json()},
+            maxlen=UPSTREAM_MAXLEN,
+            approximate=True,
+        )
+    except (RedisConnectionError, RedisTimeoutError):
+        logger.exception(
+            "failed to publish upstream '%s' for user %s", event, user_id
+        )
+        return None
     return correlation_id
 
 @sio.event
@@ -176,11 +208,6 @@ async def connect(sid: str, environ: dict, auth: object) -> None:
     user_id = await _authenticate_socket(sid, environ, auth)
     await sio.save_session(sid, {"user_id": user_id})
     await sio.enter_room(sid, f"user:{user_id}")
-    logger.info("socket %s authenticated as user %s (root)", sid, user_id)
-
-@sio.event
-async def disconnect(sid: str) -> None:
-    logger.info("socket %s disconnected (root)", sid)
 
 @sio.on("connect", namespace=LIVE_CHAT_NAMESPACE)
 async def live_chat_connect(sid: str, environ: dict, auth: object) -> None:
@@ -189,11 +216,6 @@ async def live_chat_connect(sid: str, environ: dict, auth: object) -> None:
     )
     await sio.save_session(sid, {"user_id": user_id}, namespace=LIVE_CHAT_NAMESPACE)
     await sio.emit("connection_ready", to=sid, namespace=LIVE_CHAT_NAMESPACE)
-    logger.info("socket %s authenticated as user %s (/live-chat)", sid, user_id)
-
-@sio.on("disconnect", namespace=LIVE_CHAT_NAMESPACE)
-async def live_chat_disconnect(sid: str) -> None:
-    logger.info("socket %s disconnected (/live-chat)", sid)
 
 @sio.on("join_room", namespace=LIVE_CHAT_NAMESPACE)
 async def live_chat_join_room(sid: str, data: object) -> None:
@@ -222,6 +244,9 @@ async def live_chat_send_message(sid: str, data: object) -> None:
     session = await sio.get_session(sid, namespace=LIVE_CHAT_NAMESPACE)
     user_id = session.get("user_id")
     if not user_id:
+        return
+
+    if not _is_acceptable_payload(data):
         return
 
     await _publish_upstream(
@@ -282,6 +307,8 @@ async def _dispatch_envelope(envelope: DownstreamEnvelope) -> None:
         if envelope.target.type == "sid"
         else envelope.target.room
     )
+    if to is None:
+        return
     await sio.emit(envelope.event, envelope.payload, to=to, namespace=namespace)
 
 async def _ensure_group(client: redis_async.Redis) -> None:
@@ -289,13 +316,8 @@ async def _ensure_group(client: redis_async.Redis) -> None:
         await client.xgroup_create(
             DOWNSTREAM_STREAM, CONSUMER_GROUP, id="$", mkstream=True
         )
-        logger.info(
-            "created consumer group '%s' on '%s'", CONSUMER_GROUP, DOWNSTREAM_STREAM
-        )
     except ResponseError as exc:
-        if "BUSYGROUP" in str(exc):
-            logger.info("consumer group '%s' already exists", CONSUMER_GROUP)
-        else:
+        if "BUSYGROUP" not in str(exc):
             raise
 
 async def _handle_message(
@@ -308,7 +330,6 @@ async def _handle_message(
         envelope = DownstreamEnvelope.model_validate_json(raw)
         _validate_envelope(envelope)
     except (ValidationError, ValueError) as exc:
-        logger.warning("poison message %s -> DLQ: %s", msg_id, exc)
         await client.xadd(
             DLQ_STREAM,
             {"payload": raw if raw is not None else "", "error": str(exc)},
@@ -321,18 +342,12 @@ async def _handle_message(
     try:
         await _dispatch_envelope(envelope)
     except Exception:
-        logger.exception("dispatch failed for %s; leaving unacked", msg_id)
         return
 
     await client.xack(DOWNSTREAM_STREAM, CONSUMER_GROUP, msg_id)
 
 async def _downstream_listener(client: redis_async.Redis) -> None:
     consumer = WORKER_ID
-    logger.info(
-        "downstream listener started (group=%s consumer=%s)",
-        CONSUMER_GROUP,
-        consumer,
-    )
     while True:
         try:
             response = await client.xreadgroup(
@@ -342,10 +357,19 @@ async def _downstream_listener(client: redis_async.Redis) -> None:
                 count=READ_COUNT,
                 block=BLOCK_MS,
             )
-        except asyncio.CancelledError:
-            raise
+        except ResponseError as exc:
+            if "NOGROUP" in str(exc):
+                try:
+                    await _ensure_group(client)
+                except Exception:
+                    await asyncio.sleep(1)
+                continue
+            await asyncio.sleep(1)
+            continue
+        except (RedisConnectionError, RedisTimeoutError):
+            await asyncio.sleep(1)
+            continue
         except Exception:
-            logger.exception("XREADGROUP failed; backing off 1s")
             await asyncio.sleep(1)
             continue
 
@@ -356,13 +380,29 @@ async def _downstream_listener(client: redis_async.Redis) -> None:
             for msg_id, fields in messages:
                 await _handle_message(client, msg_id, fields)
 
+def _on_listener_done(task: asyncio.Task) -> None:
+    if not task.cancelled() and task.exception() is not None:
+        logger.critical("downstream listener exited: %r", task.exception())
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     global redis_client
-    redis_client = redis_async.from_url(REDIS_URL, decode_responses=True)
-    await _ensure_group(redis_client)
+    redis_client = redis_async.from_url(
+        REDIS_URL,
+        decode_responses=True,
+        health_check_interval=30,
+        socket_keepalive=True,
+        socket_connect_timeout=15,
+        socket_timeout=60,
+        retry_on_timeout=True,
+        max_connections=10,
+    )
+    try:
+        await _ensure_group(redis_client)
+    except Exception:
+        pass
     listener = asyncio.create_task(_downstream_listener(redis_client))
-    logger.info("realtime edge ready (redis=%s)", REDIS_URL)
+    listener.add_done_callback(_on_listener_done)
     try:
         yield
     finally:
@@ -371,7 +411,6 @@ async def lifespan(_app: FastAPI):
             await listener
         await redis_client.aclose()
         redis_client = None
-        logger.info("realtime edge shut down")
 
 fastapi_app = FastAPI(title="Realtime Edge", version="0.1.0", lifespan=lifespan)
 
