@@ -139,6 +139,7 @@ async def _authenticate_socket(
             options={"require": ["exp"]},
         )
     except jwt.PyJWTError as exc:
+        logger.error(f"JWT decode error: {exc}") 
         raise socketio.exceptions.ConnectionRefusedError("invalid token") from exc
 
     user_id = _resolve_user_id(claims)
